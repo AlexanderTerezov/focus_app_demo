@@ -65,7 +65,7 @@ git clone https://github.com/AlexanderTerezov/focus_app_demo.git
 
 ### 2. Configure the backend
 
-#### Windows PowerShell
+Windows PowerShell
 
 ```bash
 $env:DATABASE_URL="postgres://focus_app_user:<password>@localhost:5432/focus_app"
