@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -21,7 +22,11 @@ import (
 )
 
 func connectDB() (*pgxpool.Pool, error) {
-	databaseURL := ""
+	databaseURL := os.Getenv("DATABASE_URL")
+
+	if databaseURL == "" {
+		return nil, fmt.Errorf("DATABASE_URL is not set")
+	}
 
 	db, err := pgxpool.New(context.Background(), databaseURL)
 

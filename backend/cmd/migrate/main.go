@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,7 +22,11 @@ type migration struct {
 func main() {
 	ctx := context.Background()
 
-	databaseURL := ""
+	databaseURL := os.Getenv("DATABASE_URL")
+
+	if databaseURL == "" {
+		log.Fatal("DATABASE_URL is not set")
+	}
 
 	conn, err := pgx.Connect(ctx, databaseURL)
 	if err != nil {

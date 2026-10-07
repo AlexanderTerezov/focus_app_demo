@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 class ApiService {
-  static const String baseUrl = 'http://192.168.0.101:8080';
+  static const String baseUrl = 'http://localhost:8080';
 
   Future<http.Response> post(
     String path, {

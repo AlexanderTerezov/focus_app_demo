@@ -7,7 +7,7 @@ import 'package:web_socket_channel/io.dart';
 import 'auth_service.dart';
 
 class WebSocketService {
-  static const String baseUrl = 'ws://192.168.0.101:8080';
+  static const String baseUrl = 'ws://localhost:8080';
 
   final AuthService _authService = AuthService();
 
