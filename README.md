@@ -5,14 +5,7 @@ Go and PostgreSQL.
 
 ## Architecture
 
-Flutter frontend
-|
-| HTTP / WebSocket
-v
-Go backend
-|
-v
-PostgreSQL
+Flutter frontend --> HTTP / WebSocket --> Go backend --> PostgreSQL
 
 ## Features
 
@@ -44,6 +37,7 @@ Backend:
 ## Project Structure
 
 frontend/ Flutter application
+
 backend/ Go REST/WebSocket API
 
 ## Setup

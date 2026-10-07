@@ -11,10 +11,6 @@ void main() async {
 
   await _initializeDesktopWindow();
 
-  /// IMPORTANT !!! REMOVE LATER DON'T FORGET ///
-  //const storage = FlutterSecureStorage();
-  //await storage.deleteAll();
-
   runApp(const MyApp());
 }
 
