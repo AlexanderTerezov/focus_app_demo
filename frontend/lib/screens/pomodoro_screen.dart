@@ -1,0 +1,1193 @@
+import 'dart:async';
+import 'dart:math' as math;
+
+import 'package:confetti/confetti.dart';
+import 'package:analytics_plugin/analytics_plugin.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+
+import '../widgets/timer_ticks.dart';
+import '../widgets/breathing_character.dart';
+import '../models/focus_session.dart';
+import '../models/focus_session_summary.dart';
+import '../services/focus_session_service.dart';
+
+class PomodoroScreen extends StatefulWidget {
+  final FocusSession focusSession;
+  final int studyMinutes;
+  final int shortBreakMinutes;
+  final int longBreakMinutes;
+  final int sessionsUntilLongBreak;
+  final Stream<Map<String, dynamic>> webSocketEvents;
+
+  const PomodoroScreen({
+    super.key,
+    required this.focusSession,
+    required this.studyMinutes,
+    required this.shortBreakMinutes,
+    required this.longBreakMinutes,
+    required this.sessionsUntilLongBreak,
+    required this.webSocketEvents,
+  });
+
+  @override
+  State<PomodoroScreen> createState() => _PomodoroScreenState();
+}
+
+class _PomodoroScreenState extends State<PomodoroScreen> {
+  final _focusSessionService = FocusSessionService();
+  StreamSubscription<Map<String, dynamic>>? _webSocketSubscription;
+
+  //  static const _foregroundCheckIntervalSeconds = 3;
+
+  static const _focusNotificationText =
+      'You seem distracted. Return to your focus session.';
+
+  static const _analytics = AnalyticsPlugin();
+
+  // Temporary demo rules; these will come from saved user settings later.
+  static const _classificationEngine = ClassificationEngine(
+    focusedKeywords: ['google docs'],
+    distractingKeywords: ['youtube'],
+  );
+
+  Timer? timer;
+
+  bool isStudy = true;
+  bool isRunning = false;
+  bool _analyticsStarted = false;
+  bool _switchingMode = false;
+  bool _endingSession = false;
+  bool _isShowingSummary = false;
+
+  int _totalDistractions = 0;
+  int _secondsSinceForegroundCheck = 0;
+  int _consecutiveDistractions = 0;
+  int completedSessions = 0;
+
+  late int totalSeconds;
+  late int remainingSeconds;
+  late DateTime currentStartedAt;
+  late int currentDurationSeconds;
+
+  late final ConfettiController _confettiController;
+
+  // ----------------------------------------------------------
+  // INIT
+  // ----------------------------------------------------------
+
+  @override
+  void initState() {
+    super.initState();
+
+    _confettiController = ConfettiController(
+      duration: const Duration(milliseconds: 10),
+    );
+
+    isStudy = widget.focusSession.currentType == 'study';
+
+    currentStartedAt = widget.focusSession.currentStartedAt!;
+    currentDurationSeconds = widget.focusSession.currentDurationSeconds!;
+
+    totalSeconds = currentDurationSeconds;
+
+    final elapsedSeconds = DateTime.now()
+        .difference(currentStartedAt)
+        .inSeconds;
+
+    if (widget.focusSession.isInfinite) {
+      remainingSeconds = elapsedSeconds;
+    } else {
+      remainingSeconds = currentDurationSeconds - elapsedSeconds;
+
+      if (remainingSeconds < 0) {
+        remainingSeconds = 0;
+      }
+    }
+
+    completedSessions = widget.focusSession.completedFocusSessions;
+
+    _webSocketSubscription = widget.webSocketEvents.listen(
+      _handleWebSocketEvent,
+    );
+
+    startTimer();
+
+    unawaited(_startAnalytics());
+  }
+
+  void _handleWebSocketEvent(Map<String, dynamic> event) {
+    final eventType = event['type'];
+    final sessionJson = event['session'];
+
+    if (sessionJson == null) {
+      return;
+    }
+
+    // Another device started a completely new focus session.
+    if (eventType == 'focus_session_started') {
+      try {
+        final session = FocusSession.fromJson(
+          sessionJson as Map<String, dynamic>,
+        );
+
+        if (!mounted) return;
+
+        // If the session summary is currently open,
+        // close it first.
+        if (_isShowingSummary) {
+          Navigator.of(context, rootNavigator: true).pop();
+        }
+
+        // Replace the current Pomodoro with the new session.
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+            builder: (_) => PomodoroScreen(
+              focusSession: session,
+              studyMinutes: session.studyDurationSeconds ~/ 60,
+              shortBreakMinutes: session.shortBreakDurationSeconds ~/ 60,
+              longBreakMinutes: session.longBreakDurationSeconds ~/ 60,
+              sessionsUntilLongBreak: session.sessionsUntilLongBreak,
+              webSocketEvents: widget.webSocketEvents,
+            ),
+          ),
+        );
+
+        return;
+      } catch (error) {
+        debugPrint('Failed to handle new focus session: $error');
+        return;
+      }
+    }
+
+    // Everything below this point belongs to
+    // the current session only.
+
+    final sessionId = sessionJson['id'];
+
+    if (sessionId != widget.focusSession.id) {
+      return;
+    }
+
+    // Another device ended the entire focus cycle.
+    if (eventType == 'focus_session_ended') {
+      // Ignore the event generated by this device's own
+      // END SESSION request.
+      if (_endingSession) {
+        return;
+      }
+
+      debugPrint('Focus session ended on another device: $sessionId');
+
+      timer?.cancel();
+      timer = null;
+
+      if (!mounted) return;
+
+      Navigator.pop(context);
+      return;
+    }
+
+    // A focus/break phase changed.
+    if (eventType == 'focus_session_phase_changed') {
+      try {
+        final session = FocusSession.fromJson(
+          sessionJson as Map<String, dynamic>,
+        );
+
+        final startedAt = session.currentStartedAt;
+        final duration = session.currentDurationSeconds;
+
+        if (startedAt == null || duration == null) {
+          debugPrint('Phase change event is missing timer information.');
+          return;
+        }
+
+        final elapsedSeconds = DateTime.now().difference(startedAt).inSeconds;
+
+        final newRemainingSeconds = duration - elapsedSeconds;
+
+        debugPrint(
+          'Phase changed to ${session.currentType} '
+          'for session ${session.id}',
+        );
+
+        if (!mounted) return;
+
+        setState(() {
+          _switchingMode = false;
+          completedSessions = session.completedFocusSessions;
+          isStudy = session.currentType == 'study';
+          currentStartedAt = startedAt;
+          currentDurationSeconds = duration;
+          totalSeconds = duration;
+          remainingSeconds = newRemainingSeconds > 0 ? newRemainingSeconds : 0;
+        });
+
+        // Usually the existing timer is still running.
+        // Start one only if it isn't.
+        if (!isRunning) {
+          startTimer();
+        }
+      } catch (error) {
+        debugPrint('Failed to handle phase change event: $error');
+      }
+    }
+  }
+
+  Future<void> _startAnalytics() async {
+    try {
+      if (!await _analytics.isSupported() || !mounted) return;
+
+      if (defaultTargetPlatform == TargetPlatform.android) {
+        // The Usage Access explanation may be shown during startup,
+        // so wait until the first frame has finished before opening
+        // a dialog.
+        await WidgetsBinding.instance.endOfFrame;
+
+        if (!mounted) return;
+
+        var hasUsageAccess = await _analytics.hasUsageAccess();
+
+        if (!mounted) return;
+
+        if (!hasUsageAccess) {
+          final shouldOpenSettings = await _confirmOpeningUsageAccessSettings();
+
+          if (!mounted || !shouldOpenSettings) return;
+
+          // On Android, this future completes when the user returns
+          // from the Usage Access settings screen.
+          await _analytics.openUsageAccessSettings();
+
+          if (!mounted) return;
+
+          hasUsageAccess = await _analytics.hasUsageAccess();
+
+          if (!mounted || !hasUsageAccess) return;
+        }
+
+        try {
+          final hasNotificationPermission = await _analytics
+              .hasNotificationPermission();
+
+          if (!hasNotificationPermission) {
+            await _analytics.requestNotificationPermission();
+          }
+        } catch (error) {
+          // Activity tracking can still run if reminders are unavailable.
+          debugPrint('Could not request notification permission: $error');
+        }
+
+        if (!mounted) return;
+      }
+
+      await _analytics.startSession();
+
+      if (!mounted) {
+        await _analytics.stopSession();
+        return;
+      }
+
+      _analyticsStarted = true;
+    } catch (error) {
+      debugPrint('Could not start analytics: $error');
+    }
+  }
+
+  Future<bool> _confirmOpeningUsageAccessSettings() async {
+    final shouldOpenSettings = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('Allow activity access?'),
+          content: const Text(
+            'Focus App uses Android Usage Access during focus sessions '
+            'to recognize the application currently in use. '
+            'This information stays on your device.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(dialogContext).pop(false);
+              },
+              child: const Text('Not now'),
+            ),
+            FilledButton(
+              onPressed: () {
+                Navigator.of(dialogContext).pop(true);
+              },
+              child: const Text('Open settings'),
+            ),
+          ],
+        );
+      },
+    );
+
+    return shouldOpenSettings ?? false;
+  }
+
+  Future<void> _stopAnalytics() async {
+    _consecutiveDistractions = 0;
+
+    if (!_analyticsStarted) return;
+
+    _analyticsStarted = false;
+
+    try {
+      await _analytics.stopSession();
+    } catch (error) {
+      debugPrint('Could not stop analytics: $error');
+    }
+  }
+
+  String _formatDuration(Duration duration) {
+    final hours = duration.inHours;
+    final minutes = duration.inMinutes.remainder(60);
+    final seconds = duration.inSeconds.remainder(60);
+
+    if (hours > 0) {
+      return '${hours}h ${minutes}m';
+    }
+
+    if (minutes > 0) {
+      return '${minutes}m ${seconds}s';
+    }
+
+    return '${seconds}s';
+  }
+
+  String _formatTime(DateTime time) {
+    final hour = time.hour.toString().padLeft(2, '0');
+    final minute = time.minute.toString().padLeft(2, '0');
+
+    return '$hour:$minute';
+  }
+
+  // ----------------------------------------------------------
+  // START TIMER
+  // ----------------------------------------------------------
+
+  void startTimer() {
+    if (isRunning) return;
+
+    setState(() {
+      isRunning = true;
+    });
+
+    timer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
+      if (_analyticsStarted) {
+        _secondsSinceForegroundCheck++;
+
+        if (_secondsSinceForegroundCheck >= 30) {
+          _secondsSinceForegroundCheck = 0;
+
+          unawaited(_refreshForegroundActivity());
+        }
+      }
+
+      final currentStartedAt = this.currentStartedAt;
+      final currentDuration = currentDurationSeconds;
+
+      final elapsedSeconds = DateTime.now()
+          .difference(currentStartedAt)
+          .inSeconds;
+
+      if (widget.focusSession.isInfinite) {
+        if (elapsedSeconds != remainingSeconds) {
+          setState(() {
+            remainingSeconds = elapsedSeconds;
+          });
+        }
+
+        return;
+      }
+
+      final newRemainingSeconds = currentDuration - elapsedSeconds;
+
+      if (newRemainingSeconds > 0) {
+        if (newRemainingSeconds != remainingSeconds) {
+          setState(() {
+            remainingSeconds = newRemainingSeconds;
+          });
+        }
+      } else if (!_switchingMode) {
+        setState(() {
+          remainingSeconds = 0;
+        });
+
+        _switchingMode = true;
+
+        unawaited(_handleModeSwitch());
+      }
+    });
+  }
+
+  Future<void> _handleModeSwitch() async {
+    timer?.cancel();
+    timer = null;
+
+    setState(() {
+      isRunning = false;
+    });
+
+    try {
+      await switchMode();
+    } finally {
+      _switchingMode = false;
+    }
+  }
+
+  Future<void> _refreshForegroundActivity() async {
+    if (!_analyticsStarted) return;
+
+    try {
+      final activity = await _analytics.getForegroundActivity();
+
+      if (!mounted || !_analyticsStarted) return;
+
+      if (activity == null) {
+        _consecutiveDistractions = 0;
+        return;
+      }
+
+      final classification = _classificationEngine.classify(activity);
+
+      if (!isStudy || classification != ActivityClassification.distracting) {
+        _consecutiveDistractions = 0;
+        return;
+      }
+
+      // Require three consecutive distracting readings so a brief
+      // app switch does not immediately interrupt the user.
+      _consecutiveDistractions++;
+      _totalDistractions++;
+
+      // Equality sends only one reminder during an uninterrupted
+      // distraction.
+      if (_consecutiveDistractions == 3) {
+        await _showFocusNotification();
+      }
+    } catch (_) {
+      if (!mounted || !_analyticsStarted) return;
+
+      _consecutiveDistractions = 0;
+    }
+  }
+
+  Future<void> _showFocusNotification() async {
+    try {
+      await _analytics.showNotification(_focusNotificationText);
+    } catch (error) {
+      debugPrint('Could not show focus notification: $error');
+    }
+  }
+
+  // ----------------------------------------------------------
+  // SWITCH MODE
+  // ----------------------------------------------------------
+
+  Future<void> switchMode() async {
+    _consecutiveDistractions = 0;
+
+    try {
+      final response = await _focusSessionService.completeFocusSession(
+        sessionId: widget.focusSession.id,
+      );
+
+      final nextType = response['next_type'] as String;
+
+      final completedFocusSessions =
+          response['completed_focus_sessions'] as int;
+
+      if (!mounted) return;
+
+      setState(() {
+        completedSessions = completedFocusSessions;
+
+        isStudy = nextType == 'study';
+
+        currentStartedAt = DateTime.now();
+
+        if (nextType == 'long_break') {
+          currentDurationSeconds = widget.longBreakMinutes * 60;
+        } else if (nextType == 'short_break') {
+          currentDurationSeconds = widget.shortBreakMinutes * 60;
+        } else {
+          currentDurationSeconds = widget.studyMinutes * 60;
+        }
+
+        totalSeconds = currentDurationSeconds;
+        remainingSeconds = currentDurationSeconds;
+      });
+
+      startTimer();
+    } catch (error) {
+      debugPrint('Failed to complete focus session: $error');
+    }
+  }
+
+  // ----------------------------------------------------------
+  // END SESSION
+  // ----------------------------------------------------------
+
+  Future<void> endSession() async {
+    if (_endingSession) return;
+
+    _endingSession = true;
+
+    try {
+      timer?.cancel();
+      timer = null;
+
+      final endedAt = DateTime.now();
+
+      final result = await _focusSessionService.endFocusSession(
+        sessionId: widget.focusSession.id,
+      );
+
+      final pointsEarned = result['points_earned'] as int? ?? 0;
+
+      final summary = _buildSessionSummary(
+        endedAt: endedAt,
+        pointsEarned: pointsEarned,
+      );
+
+      if (!mounted) return;
+
+      await _showSessionSummary(summary);
+
+      if (!mounted) return;
+
+      Navigator.pop(context, result);
+    } catch (error) {
+      _endingSession = false;
+
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(error.toString().replaceFirst('Exception: ', '')),
+        ),
+      );
+    }
+  }
+
+  // ----------------------------------------------------------
+  // PROGRESS
+  // ----------------------------------------------------------
+
+  double get progress {
+    if (totalSeconds == 0) return 0;
+
+    return 1 - (remainingSeconds / totalSeconds);
+  }
+
+  // ----------------------------------------------------------
+  // TIME STRING
+  // ----------------------------------------------------------
+
+  String get timeString {
+    final hours = remainingSeconds ~/ 3600;
+    final minutes = (remainingSeconds % 3600) ~/ 60;
+    final seconds = remainingSeconds % 60;
+
+    if (hours > 0) {
+      return '${hours.toString().padLeft(2, '0')}:'
+          '${minutes.toString().padLeft(2, '0')}:'
+          '${seconds.toString().padLeft(2, '0')}';
+    }
+
+    return '${minutes.toString().padLeft(2, '0')}:'
+        '${seconds.toString().padLeft(2, '0')}';
+  }
+
+  // ----------------------------------------------------------
+  // DISPOSE
+  // ----------------------------------------------------------
+
+  @override
+  void dispose() {
+    _webSocketSubscription?.cancel();
+
+    timer?.cancel();
+
+    unawaited(_stopAnalytics());
+
+    _confettiController.dispose();
+
+    super.dispose();
+  }
+
+  // ----------------------------------------------------------
+  // SUMMARY
+  // ----------------------------------------------------------
+
+  FocusSessionSummary _buildSessionSummary({
+    required DateTime endedAt,
+    required int pointsEarned,
+  }) {
+    final startedAt = widget.focusSession.startedAt ?? endedAt;
+    final totalDuration = endedAt.difference(startedAt);
+
+    Duration focusedDuration;
+    Duration breakDuration;
+
+    if (widget.focusSession.isInfinite) {
+      focusedDuration = totalDuration;
+      breakDuration = Duration.zero;
+    } else {
+      final currentPhaseElapsed = DateTime.now().difference(currentStartedAt);
+
+      final clampedCurrentPhaseElapsed = Duration(
+        seconds: currentPhaseElapsed.inSeconds.clamp(0, currentDurationSeconds),
+      );
+
+      final completedFocusDuration = Duration(
+        seconds: completedSessions * widget.studyMinutes * 60,
+      );
+
+      if (isStudy) {
+        focusedDuration = completedFocusDuration + clampedCurrentPhaseElapsed;
+        breakDuration = totalDuration - focusedDuration;
+      } else {
+        focusedDuration = completedFocusDuration;
+        breakDuration = totalDuration - focusedDuration;
+      }
+    }
+
+    if (focusedDuration.isNegative) {
+      focusedDuration = Duration.zero;
+    }
+
+    if (breakDuration.isNegative) {
+      breakDuration = Duration.zero;
+    }
+
+    return FocusSessionSummary(
+      startedAt: startedAt,
+      endedAt: endedAt,
+      totalDuration: totalDuration,
+      focusedDuration: focusedDuration,
+      breakDuration: breakDuration,
+      completedFocusSessions: completedSessions,
+      distractions: _totalDistractions,
+      pointsEarned: pointsEarned,
+    );
+  }
+
+  Future<void> _showSessionSummary(FocusSessionSummary summary) async {
+    _isShowingSummary = true;
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      barrierColor: Colors.black.withValues(alpha: 0.45),
+      builder: (context) {
+        final isDark = Theme.of(context).brightness == Brightness.dark;
+        final surfaceColor = isDark ? const Color(0xFF151D2F) : Colors.white;
+        final subtleSurfaceColor = isDark
+            ? Colors.white.withValues(alpha: 0.08)
+            : Colors.black.withValues(alpha: 0.05);
+        final textColor = isDark ? Colors.white : const Color(0xFF263746);
+        final secondaryColor = isDark
+            ? Colors.white70
+            : const Color(0xAA34495E);
+        final buttonColor = isDark ? Colors.white : const Color(0xFF34495E);
+        final buttonTextColor = isDark ? Colors.black : Colors.white;
+
+        // Start confetti only after the ConfettiWidget
+        // has been rendered.
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted && completedSessions >= 1) {
+            _confettiController.play();
+          }
+        });
+
+        return Dialog(
+          backgroundColor: Colors.transparent,
+          elevation: 0,
+          insetPadding: const EdgeInsets.symmetric(
+            horizontal: 28,
+            vertical: 24,
+          ),
+          child: Stack(
+            clipBehavior: Clip.none,
+            children: [
+              Container(
+                padding: const EdgeInsets.fromLTRB(24, 26, 24, 20),
+                decoration: BoxDecoration(
+                  color: surfaceColor,
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      'Session Complete',
+                      style: TextStyle(
+                        color: textColor,
+                        fontSize: 26,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'Here is your session summary',
+                      style: TextStyle(color: secondaryColor, fontSize: 14),
+                    ),
+                    const SizedBox(height: 22),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.symmetric(vertical: 20),
+                      decoration: BoxDecoration(
+                        color: subtleSurfaceColor,
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                      child: Column(
+                        children: [
+                          Text(
+                            _formatDuration(summary.focusedDuration),
+                            style: TextStyle(
+                              color: textColor,
+                              fontSize: 30,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            'Focused time',
+                            style: TextStyle(
+                              color: secondaryColor,
+                              fontSize: 13,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: _SummaryStat(
+                            value: widget.focusSession.isInfinite
+                                ? '—'
+                                : summary.completedFocusSessions.toString(),
+                            label: 'Focus sessions',
+                            textColor: textColor,
+                            secondaryColor: secondaryColor,
+                            backgroundColor: subtleSurfaceColor,
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: _SummaryStat(
+                            value: summary.distractions.toString(),
+                            label: 'Distractions',
+                            textColor: textColor,
+                            secondaryColor: secondaryColor,
+                            backgroundColor: subtleSurfaceColor,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 10,
+                      ),
+                      decoration: BoxDecoration(
+                        color: subtleSurfaceColor,
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      child: Column(
+                        children: [
+                          _SummaryInfoRow(
+                            label: 'Started',
+                            value: _formatTime(summary.startedAt.toLocal()),
+                            textColor: textColor,
+                            secondaryColor: secondaryColor,
+                          ),
+                          _SummaryInfoRow(
+                            label: 'Ended',
+                            value: _formatTime(summary.endedAt.toLocal()),
+                            textColor: textColor,
+                            secondaryColor: secondaryColor,
+                          ),
+                          _SummaryInfoRow(
+                            label: 'Total time',
+                            value: _formatDuration(summary.totalDuration),
+                            textColor: textColor,
+                            secondaryColor: secondaryColor,
+                          ),
+                          _SummaryInfoRow(
+                            label: 'Break time',
+                            value: _formatDuration(summary.breakDuration),
+                            textColor: textColor,
+                            secondaryColor: secondaryColor,
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      '+${summary.pointsEarned} points',
+                      style: TextStyle(
+                        color: textColor,
+                        fontSize: 18,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton(
+                        onPressed: () {
+                          Navigator.of(context).pop();
+                        },
+                        style: FilledButton.styleFrom(
+                          backgroundColor: buttonColor,
+                          foregroundColor: buttonTextColor,
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(26),
+                          ),
+                        ),
+                        child: const Text('DONE'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
+              // LEFT BURST
+              Positioned(
+                left: -10,
+                bottom: -10,
+                child: IgnorePointer(
+                  child: SizedBox(
+                    width: 100,
+                    height: 100,
+                    child: ConfettiWidget(
+                      confettiController: _confettiController,
+                      blastDirection: -math.pi / 4,
+                      blastDirectionality: BlastDirectionality.directional,
+                      shouldLoop: false,
+                      emissionFrequency: 1,
+                      numberOfParticles: 18,
+                      gravity: 0.45,
+                      maxBlastForce: 18,
+                      minBlastForce: 12,
+                    ),
+                  ),
+                ),
+              ),
+
+              // RIGHT BURST
+              Positioned(
+                right: -10,
+                bottom: -10,
+                child: IgnorePointer(
+                  child: SizedBox(
+                    width: 100,
+                    height: 100,
+                    child: ConfettiWidget(
+                      confettiController: _confettiController,
+                      blastDirection: -3 * math.pi / 4,
+                      blastDirectionality: BlastDirectionality.directional,
+                      shouldLoop: false,
+                      emissionFrequency: 1,
+                      numberOfParticles: 18,
+                      gravity: 0.45,
+                      maxBlastForce: 18,
+                      minBlastForce: 12,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  // ----------------------------------------------------------
+  // BUILD
+  // ----------------------------------------------------------
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    final backgroundColors = isDark
+        ? const [
+            Color(0xFF0B1020),
+            Color(0xFF14253A),
+            Color(0xFF394052),
+            Color(0xFF6B493F),
+            Color(0xFF9A5A3A),
+          ]
+        : const [
+            Color(0xFFBFDDF2),
+            Color(0xFFA9CDE8),
+            Color(0xFFC5C9C5),
+            Color(0xFFE0B49A),
+            Color(0xFFD58B62),
+          ];
+
+    final primaryTextColor = isDark ? Colors.white : const Color(0xFF263746);
+
+    final secondaryTextColor = isDark
+        ? Colors.white54
+        : const Color(0x8834495E);
+
+    final tickColor = isDark
+        ? const Color.fromARGB(24, 255, 255, 255)
+        : const Color.fromARGB(24, 52, 73, 94);
+
+    final ringColor = isDark ? Colors.white : const Color(0xFF34495E);
+
+    return Scaffold(
+      body: Stack(
+        children: [
+          // --------------------------------------------------
+          // GRADIENT
+          // --------------------------------------------------
+
+          Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: backgroundColors,
+              ),
+            ),
+          ),
+
+          // --------------------------------------------------
+          // 3D IMAGE
+          // --------------------------------------------------
+          IgnorePointer(
+            child: Align(
+              alignment: Alignment.bottomCenter,
+              child: Stack(
+                alignment: Alignment.bottomCenter,
+                children: [
+                  Image.asset('assets/images/test.webp'),
+
+                  BreathingCharacter(
+                    imagePath: isStudy
+                        ? 'assets/images/lil_guy_readin.webp'
+                        : 'assets/images/lil_guy_chillin.webp',
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          // --------------------------------------------------
+          // TIMER CONTENT
+          // --------------------------------------------------
+          SafeArea(
+            child: Stack(
+              children: [
+                Positioned(
+                  top: MediaQuery.of(context).size.height * 0.18,
+                  left: 0,
+                  right: 0,
+                  child: Column(
+                    children: [
+                      // --------------------------------------
+                      // MODE
+                      // --------------------------------------
+
+                      Text(
+                        isStudy ? 'FOCUS' : 'BREAK',
+                        style: TextStyle(
+                          color: primaryTextColor.withValues(alpha: .7),
+                          fontSize: 14,
+                          letterSpacing: 4,
+                        ),
+                      ),
+
+                      const SizedBox(height: 25),
+
+                      // --------------------------------------
+                      // CIRCULAR TIMER
+                      // --------------------------------------
+                      SizedBox(
+                        width: 310,
+                        height: 310,
+                        child: Stack(
+                          alignment: Alignment.center,
+                          children: [
+                            // Physical timer ticks
+                            TimerTicks(
+                              size: 260,
+                              tickLength: 4,
+                              tickWidth: 2,
+                              color: tickColor,
+                            ),
+
+                            // Progress ring
+                            SizedBox(
+                              width: 280,
+                              height: 280,
+                              child: CircularProgressIndicator(
+                                value: widget.focusSession.isInfinite
+                                    ? 0
+                                    : progress,
+                                strokeWidth: 7,
+                                backgroundColor: primaryTextColor.withValues(
+                                  alpha: .12,
+                                ),
+                                valueColor: AlwaysStoppedAnimation<Color>(
+                                  ringColor,
+                                ),
+                              ),
+                            ),
+
+                            // Timer text
+                            Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(
+                                  timeString,
+                                  style: TextStyle(
+                                    color: primaryTextColor,
+                                    fontSize: 52,
+                                    fontWeight: FontWeight.w300,
+                                  ),
+                                ),
+
+                                const SizedBox(height: 8),
+
+                                Text(
+                                  widget.focusSession.isInfinite
+                                      ? 'INFINITE'
+                                      : '$completedSessions / ${widget.sessionsUntilLongBreak}',
+                                  style: TextStyle(
+                                    color: secondaryTextColor,
+                                    fontSize: 14,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+
+                      // --------------------------------------
+                      // END SESSION
+                      // --------------------------------------
+                      const SizedBox(height: 35),
+
+                      TextButton(
+                        onPressed: endSession,
+                        child: Text(
+                          'END SESSION',
+                          style: TextStyle(
+                            color: secondaryTextColor,
+                            fontSize: 13,
+                            letterSpacing: 1.5,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SummaryStat extends StatelessWidget {
+  final String value;
+  final String label;
+  final Color textColor;
+  final Color secondaryColor;
+  final Color backgroundColor;
+
+  const _SummaryStat({
+    required this.value,
+    required this.label,
+    required this.textColor,
+    required this.secondaryColor,
+    required this.backgroundColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 8),
+      decoration: BoxDecoration(
+        color: backgroundColor,
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Column(
+        children: [
+          Text(
+            value,
+            style: TextStyle(
+              color: textColor,
+              fontSize: 20,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+
+          const SizedBox(height: 3),
+
+          Text(
+            label,
+            textAlign: TextAlign.center,
+            style: TextStyle(color: secondaryColor, fontSize: 12),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SummaryInfoRow extends StatelessWidget {
+  final String label;
+  final String value;
+  final Color textColor;
+  final Color secondaryColor;
+
+  const _SummaryInfoRow({
+    required this.label,
+    required this.value,
+    required this.textColor,
+    required this.secondaryColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label, style: TextStyle(color: secondaryColor, fontSize: 14)),
+
+          Text(
+            value,
+            style: TextStyle(
+              color: textColor,
+              fontSize: 14,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}

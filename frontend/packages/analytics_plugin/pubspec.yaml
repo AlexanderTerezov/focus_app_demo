@@ -1,0 +1,25 @@
+name: analytics_plugin
+description: Local activity analytics plugin for Android, Linux, and Windows focus sessions.
+version: 0.1.0
+publish_to: "none"
+
+environment:
+  sdk: ^3.13.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: com.example.analytics_plugin
+        pluginClass: AnalyticsPlugin
+      linux:
+        pluginClass: AnalyticsPlugin
+      windows:
+        pluginClass: AnalyticsPluginCApi

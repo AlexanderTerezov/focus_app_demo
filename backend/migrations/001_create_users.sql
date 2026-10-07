@@ -1,0 +1,14 @@
+CREATE TABLE users (
+    id BIGSERIAL PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    score INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+GRANT SELECT, INSERT, UPDATE, DELETE, REFERENCES
+ON TABLE users TO focus_app_user;
+
+GRANT USAGE, SELECT
+ON SEQUENCE users_id_seq TO focus_app_user;
